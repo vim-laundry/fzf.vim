@@ -40,7 +40,7 @@ if [ -z "$CENTER" ]; then
 fi
 
 if [ -z "$FZF_PREVIEW_COMMAND" ] && command -v bat > /dev/null; then
-  bat --style="${BAT_STYLE:-numbers}" --color=always --pager=never \
+  bat --style=plain,changes --color=always --pager=never \
       --highlight-line=$CENTER "$FILE"
   exit $?
 fi
