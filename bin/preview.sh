@@ -40,12 +40,12 @@ if [ -z "$CENTER" ]; then
 fi
 
 if [ -z "$FZF_PREVIEW_COMMAND" ] && command -v bat > /dev/null; then
-  bat --style=plain,changes --color=always --pager=never \
+  bat --style=plain --color=always --theme=greyshades --pager=never \
       --highlight-line=$CENTER "$FILE"
   exit $?
 fi
 
-DEFAULT_COMMAND="highlight -O ansi -l {} || coderay {} || rougify {} || cat {}"
+DEFAULT_COMMAND="cat {}"
 CMD=${FZF_PREVIEW_COMMAND:-$DEFAULT_COMMAND}
 CMD=${CMD//{\}/$(printf %q "$FILE")}
 
