@@ -72,7 +72,7 @@ function! s:check_requirements()
     throw "fzf#exec function not found. You need to upgrade Vim plugin from the main fzf repository ('junegunn/fzf')"
   endif
   let exec = fzf#exec()
-  let output = systemlist(exec . ' --version')
+  let output = split(system(exec . ' --version'), "\n")
   if v:shell_error || empty(output)
     throw 'Failed to run "fzf --version": ' . string(output)
   endif
@@ -138,9 +138,19 @@ function! fzf#vim#with_preview(...)
   " Placeholder expression (TODO/TBD: undocumented)
   let placeholder = get(spec, 'placeholder', '{}')
 
-  " Preview window
+  " g:fzf_preview_window
+  if empty(args)
+    let preview_args = get(g:, 'fzf_preview_window', ['', 'ctrl-/'])
+    if empty(preview_args)
+      let args = ['hidden']
+    else
+      " For backward-compatiblity
+      let args = type(preview_args) == type('') ? [preview_args] : copy(preview_args)
+    endif
+  endif
+
   if len(args) && type(args[0]) == s:TYPE.string
-    if args[0] !~# '^\(up\|down\|left\|right\)'
+    if len(args[0]) && args[0] !~# '^\(up\|down\|left\|right\|hidden\)'
       throw 'invalid preview window: '.args[0]
     endif
     let window = args[0]
@@ -153,6 +163,12 @@ function! fzf#vim#with_preview(...)
   endif
   if s:is_win
     let is_wsl_bash = exepath('bash') =~? 'Windows[/\\]system32[/\\]bash.exe$'
+    if empty($MSWINHOME)
+      let $MSWINHOME = $HOME
+    endif
+    if is_wsl_bash && $WSLENV !~# '[:]\?MSWINHOME\(\/[^:]*\)\?\(:\|$\)'
+      let $WSLENV = 'MSWINHOME/u:'.$WSLENV
+    endif
     let preview_cmd = 'bash '.(is_wsl_bash
     \ ? substitute(substitute(s:bin.preview, '^\([A-Z]\):', '/mnt/\L\1', ''), '\', '/', 'g')
     \ : escape(s:bin.preview, '\'))
@@ -286,6 +302,7 @@ function! s:fzf(name, opts, extra)
     throw 'invalid number of arguments'
   endif
 
+  let extra  = copy(extra)
   let eopts  = has_key(extra, 'options') ? remove(extra, 'options') : ''
   let merged = extend(copy(a:opts), extra)
   call s:merge_opts(merged, eopts)
@@ -623,10 +640,16 @@ function! fzf#vim#gitfiles(args, ...)
   " Here be dragons!
   " We're trying to access the common sink function that fzf#wrap injects to
   " the options dictionary.
+  let preview = printf(
+    \ 'bash -c "if [[ {1} =~ M ]]; then %s; else %s {-1}; fi"',
+    \ executable('delta')
+      \ ? 'git diff -- {-1} | delta --width $FZF_PREVIEW_COLUMNS --file-style=omit | sed 1d'
+      \ : 'git diff --color=always -- {-1} | sed 1,4d',
+    \ s:bin.preview)
   let wrapped = fzf#wrap({
   \ 'source':  'git -c color.status=always status --short --untracked-files=all',
   \ 'dir':     root,
-  \ 'options': ['--ansi', '--multi', '--nth', '2..,..', '--tiebreak=index', '--prompt', 'GitFiles?> ', '--preview', 'sh -c "(git diff --color=always -- {-1} | sed 1,4d; cat {-1}) | head -1000"']
+  \ 'options': ['--ansi', '--multi', '--nth', '2..,..', '--tiebreak=index', '--prompt', 'GitFiles?> ', '--preview', preview]
   \})
   call s:remove_layout(wrapped)
   let wrapped.common_sink = remove(wrapped, 'sink*')
@@ -706,10 +729,13 @@ endfunction
 function! fzf#vim#buffers(...)
   let [query, args] = (a:0 && type(a:1) == type('')) ?
         \ [a:1, a:000[1:]] : ['', a:000]
+  let sorted = fzf#vim#_buflisted_sorted()
+  let header_lines = '--header-lines=' . (bufnr('') == get(sorted, 0, 0) ? 1 : 0)
+  let tabstop = len(max(sorted)) >= 4 ? 9 : 8
   return s:fzf('buffers', {
-  \ 'source':  map(fzf#vim#_buflisted_sorted(), 'fzf#vim#_format_buffer(v:val)'),
+  \ 'source':  map(sorted, 'fzf#vim#_format_buffer(v:val)'),
   \ 'sink*':   s:function('s:bufopen'),
-  \ 'options': ['+m', '-x', '--tiebreak=index', '--header-lines=1', '--ansi', '-d', '\t', '--with-nth', '3..', '-n', '2,1..2', '--prompt', 'Buf> ', '--query', query, '--preview-window', '+{2}-/2']
+  \ 'options': ['+m', '-x', '--tiebreak=index', header_lines, '--ansi', '-d', '\t', '--with-nth', '3..', '-n', '2,1..2', '--prompt', 'Buf> ', '--query', query, '--preview-window', '+{2}-/2', '--tabstop', tabstop]
   \}, args)
 endfunction
 
@@ -741,7 +767,7 @@ function! s:ag_handler(lines, has_column)
     call s:open(cmd, first.filename)
     execute first.lnum
     if a:has_column
-      execute 'normal!' first.col.'|'
+      call cursor(0, first.col)
     endif
     normal! zz
   catch
@@ -786,8 +812,7 @@ function! fzf#vim#grep(grep_command, has_column, ...)
   \ 'column':  a:has_column,
   \ 'options': ['--ansi', '--prompt', capname.'> ',
   \             '--multi', '--bind', 'alt-a:select-all,alt-d:deselect-all',
-  \             '--delimiter', ':', '--preview-window', '+{2}-/2',
-  \             '--color', 'hl:4,hl+:12']
+  \             '--delimiter', ':', '--preview-window', '+{2}-/2']
   \}
   function! opts.sink(lines)
     return s:ag_handler(a:lines, self.column)
@@ -934,7 +959,7 @@ function! fzf#vim#tags(query, ...)
   return s:fzf('tags', {
   \ 'source':  'perl '.fzf#shellescape(s:bin.tags).' '.join(map(tagfiles, 'fzf#shellescape(fnamemodify(v:val, ":p"))')),
   \ 'sink*':   s:function('s:tags_sink'),
-  \ 'options': extend(opts, ['--nth', '1..2', '-m', '--tiebreak=begin', '--prompt', 'Tags> ', '--query', a:query])}, a:000)
+  \ 'options': extend(opts, ['--nth', '1..2', '-m', '-d', '\t', '--tiebreak=begin', '--prompt', 'Tags> ', '--query', a:query])}, a:000)
 endfunction
 
 " ------------------------------------------------------------------
@@ -957,7 +982,7 @@ function! fzf#vim#snippets(...)
   let colored = map(aligned, 's:yellow(v:val[0])."\t".v:val[1]')
   return s:fzf('snippets', {
   \ 'source':  colored,
-  \ 'options': '--ansi --tiebreak=index +m -n 1 -d "\t"',
+  \ 'options': '--ansi --tiebreak=index +m -n 1,.. -d "\t"',
   \ 'sink':    s:function('s:inject_snippet')}, a:000)
 endfunction
 
@@ -979,6 +1004,7 @@ function! s:command_sink(lines)
   if empty(a:lines[0])
     call feedkeys(':'.cmd.(a:lines[1][0] == '!' ? '' : ' '), 'n')
   else
+    call histadd(':', cmd)
     execute cmd
   endif
 endfunction
@@ -1175,7 +1201,7 @@ function! s:commits_sink(lines)
   endfor
 endfunction
 
-function! s:commits(buffer_local, args)
+function! s:commits(range, buffer_local, args)
   let s:git_root = s:get_git_root()
   if empty(s:git_root)
     return s:warn('Not in git repository')
@@ -1189,16 +1215,19 @@ function! s:commits(buffer_local, args)
     let managed = !v:shell_error
   endif
 
-  if a:buffer_local
+  if len(a:range) || a:buffer_local
     if !managed
       return s:warn('The current buffer is not in the working tree')
     endif
-    let source .= ' --follow '.fzf#shellescape(current)
+    let source .= len(a:range)
+      \ ? printf(' -L %d,%d:%s --no-patch', a:range[0], a:range[1], fzf#shellescape(current))
+      \ : (' --follow '.fzf#shellescape(current))
+    let command = 'BCommits'
   else
     let source .= ' --graph'
+    let command = 'Commits'
   endif
 
-  let command = a:buffer_local ? 'BCommits' : 'Commits'
   let expect_keys = join(keys(get(g:, 'fzf_action', s:default_action)), ',')
   let options = {
   \ 'source':  source,
@@ -1215,19 +1244,42 @@ function! s:commits(buffer_local, args)
   endif
 
   if !s:is_win && &columns > s:wide
+    let suffix = executable('delta') ? '| delta --width $FZF_PREVIEW_COLUMNS' : '--color=always'
     call extend(options.options,
-    \ ['--preview', 'echo {} | grep -o "[a-f0-9]\{7,\}" | head -1 | xargs git show --format=format: --color=always | head -1000'])
+    \ ['--preview', 'echo {} | grep -o "[a-f0-9]\{7,\}" | head -1 | xargs git show --format=format: ' . suffix])
   endif
 
   return s:fzf(a:buffer_local ? 'bcommits' : 'commits', options, a:args)
 endfunction
 
-function! fzf#vim#commits(...)
-  return s:commits(0, a:000)
+" Heuristically determine if the user specified a range
+function! s:given_range(line1, line2)
+  " 1. From visual mode
+  "   :'<,'>Commits
+  " 2. From command-line
+  "   :10,20Commits
+  if a:line1 == line("'<") && a:line2 == line("'>") ||
+        \ (a:line1 != 1 || a:line2 != line('$'))
+    return [a:line1, a:line2]
+  endif
+
+  return []
 endfunction
 
-function! fzf#vim#buffer_commits(...)
-  return s:commits(1, a:000)
+function! fzf#vim#commits(...) range
+  if exists('b:fzf_winview')
+    call winrestview(b:fzf_winview)
+    unlet b:fzf_winview
+  endif
+  return s:commits(s:given_range(a:firstline, a:lastline), 0, a:000)
+endfunction
+
+function! fzf#vim#buffer_commits(...) range
+  if exists('b:fzf_winview')
+    call winrestview(b:fzf_winview)
+    unlet b:fzf_winview
+  endif
+  return s:commits(s:given_range(a:firstline, a:lastline), 1, a:000)
 endfunction
 
 " ------------------------------------------------------------------
@@ -1336,10 +1388,15 @@ function! s:complete_insert(lines)
   let &ve = ve
   if mode() =~ 't'
     call feedkeys('a', 'n')
-  else
+  elseif has('nvim')
     execute "normal! \<esc>la"
+  else
+    call feedkeys("\<Plug>(-fzf-complete-finish)")
   endif
 endfunction
+
+nnoremap <silent> <Plug>(-fzf-complete-finish) a
+inoremap <silent> <Plug>(-fzf-complete-finish) <c-o>l
 
 function! s:eval(dict, key, arg)
   if has_key(a:dict, a:key) && type(a:dict[a:key]) == s:TYPE.funcref
