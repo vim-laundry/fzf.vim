@@ -28,37 +28,78 @@ set cpo&vim
 " Common
 " ------------------------------------------------------------------
 
+let s:winpath = {}
+function! s:winpath(path)
+  if has_key(s:winpath, a:path)
+    return s:winpath[a:path]
+  endif
+
+  let winpath = split(system('for %A in ("'.a:path.'") do @echo %~sA'), "\n")[0]
+  let s:winpath[a:path] = winpath
+
+  return winpath
+endfunction
+
+let s:warned = 0
+function! s:bash()
+  if exists('s:bash')
+    return s:bash
+  endif
+
+  let custom_bash = get(g:, 'fzf_preview_bash', '')
+  let git_bash = 'C:\Program Files\Git\bin\bash.exe'
+  let candidates = filter(s:is_win ? [custom_bash, 'bash', git_bash] : [custom_bash, 'bash'], 'len(v:val)')
+
+  let found = filter(map(copy(candidates), 'exepath(v:val)'), 'len(v:val)')
+  if empty(found)
+    if !s:warned
+      call s:warn(printf('Preview window not supported (%s not found)', join(candidates, ', ')))
+      let s:warned = 1
+    endif
+    let s:bash = ''
+    return s:bash
+  endif
+
+  let s:bash = found[0]
+
+  " Make 8.3 filename via cmd.exe
+  if s:is_win
+    let s:bash = s:winpath(s:bash)
+  endif
+
+  return s:bash
+endfunction
+
+function! s:escape_for_bash(path)
+  if !s:is_win
+    return fzf#shellescape(a:path)
+  endif
+
+  if !exists('s:is_linux_like_bash')
+    call system(s:bash . ' -c "ls /mnt/[A-Za-z]"')
+    let s:is_linux_like_bash = v:shell_error == 0
+  endif
+
+  let path = substitute(a:path, '\', '/', 'g')
+  if s:is_linux_like_bash
+    let path = substitute(path, '^\([A-Z]\):', '/mnt/\L\1', '')
+  endif
+
+  return escape(path, ' ')
+endfunction
+
 let s:min_version = '0.23.0'
 let s:is_win = has('win32') || has('win64')
+let s:is_wsl_bash = s:is_win && (exepath('bash') =~? 'Windows[/\\]system32[/\\]bash.exe$')
 let s:layout_keys = ['window', 'up', 'down', 'left', 'right']
 let s:bin_dir = expand('<sfile>:p:h:h:h').'/bin/'
 let s:bin = {
 \ 'preview': s:bin_dir.'preview.sh',
 \ 'tags':    s:bin_dir.'tags.pl' }
-let s:TYPE = {'dict': type({}), 'funcref': type(function('call')), 'string': type(''), 'list': type([])}
-if s:is_win
-  if has('nvim')
-    let s:bin.preview = split(system('for %A in ("'.s:bin.preview.'") do @echo %~sA'), "\n")[0]
-  else
-    let s:bin.preview = fnamemodify(s:bin.preview, ':8')
-  endif
-endif
+let s:TYPE = {'bool': type(0), 'dict': type({}), 'funcref': type(function('call')), 'string': type(''), 'list': type([])}
 
 let s:wide = 120
-let s:warned = 0
 let s:checked = 0
-
-function! s:version_requirement(val, min)
-  let val = split(a:val, '\.')
-  let min = split(a:min, '\.')
-  for idx in range(0, len(min) - 1)
-    let v = get(val, idx, 0)
-    if     v < min[idx] | return 0
-    elseif v > min[idx] | return 1
-    endif
-  endfor
-  return 1
-endfunction
 
 function! s:check_requirements()
   if s:checked
@@ -71,18 +112,7 @@ function! s:check_requirements()
   if !exists('*fzf#exec')
     throw "fzf#exec function not found. You need to upgrade Vim plugin from the main fzf repository ('junegunn/fzf')"
   endif
-  let exec = fzf#exec()
-  let output = split(system(exec . ' --version'), "\n")
-  if v:shell_error || empty(output)
-    throw 'Failed to run "fzf --version": ' . string(output)
-  endif
-  let fzf_version = matchstr(output[-1], '[0-9.]\+')
-
-  if s:version_requirement(fzf_version, s:min_version)
-    let s:checked = 1
-    return
-  end
-  throw printf('You need to upgrade fzf. Found: %s (%s). Required: %s or above.', fzf_version, exec, s:min_version)
+  let s:checked = !empty(fzf#exec(s:min_version))
 endfunction
 
 function! s:extend_opts(dict, eopts, prepend)
@@ -113,7 +143,7 @@ function! s:prepend_opts(dict, eopts)
   return s:extend_opts(a:dict, a:eopts, 1)
 endfunction
 
-" [[spec to wrap], [preview window expression], [toggle-preview keys...]]
+" [spec to wrap], [preview window expression], [toggle-preview keys...]
 function! fzf#vim#with_preview(...)
   " Default spec
   let spec = {}
@@ -127,11 +157,7 @@ function! fzf#vim#with_preview(...)
     call remove(args, 0)
   endif
 
-  if !executable('bash')
-    if !s:warned
-      call s:warn('Preview window not supported (bash not found in PATH)')
-      let s:warned = 1
-    endif
+  if !executable(s:bash())
     return spec
   endif
 
@@ -162,21 +188,19 @@ function! fzf#vim#with_preview(...)
     let preview += ['--preview-window', window]
   endif
   if s:is_win
-    let is_wsl_bash = exepath('bash') =~? 'Windows[/\\]system32[/\\]bash.exe$'
     if empty($MSWINHOME)
       let $MSWINHOME = $HOME
     endif
-    if is_wsl_bash && $WSLENV !~# '[:]\?MSWINHOME\(\/[^:]*\)\?\(:\|$\)'
+    if s:is_wsl_bash && $WSLENV !~# '[:]\?MSWINHOME\(\/[^:]*\)\?\(:\|$\)'
       let $WSLENV = 'MSWINHOME/u:'.$WSLENV
     endif
-    let preview_cmd = 'bash '.(is_wsl_bash
-    \ ? substitute(substitute(s:bin.preview, '^\([A-Z]\):', '/mnt/\L\1', ''), '\', '/', 'g')
-    \ : escape(s:bin.preview, '\'))
-  else
-    let preview_cmd = fzf#shellescape(s:bin.preview)
   endif
+  let preview_cmd = s:bash() . ' ' . s:escape_for_bash(s:bin.preview)
   if len(placeholder)
     let preview += ['--preview', preview_cmd.' '.placeholder]
+  end
+  if &ambiwidth ==# 'double'
+    let preview += ['--no-unicode']
   end
 
   if len(args)
@@ -322,6 +346,7 @@ endfunction
 
 function! s:open(cmd, target)
   if stridx('edit', a:cmd) == 0 && fnamemodify(a:target, ':p') ==# expand('%:p')
+    normal! m'
     return
   endif
   execute a:cmd s:escape(a:target)
@@ -619,35 +644,61 @@ endfunction
 " GFiles[?]
 " ------------------------------------------------------------------
 
-function! s:get_git_root()
-  let root = split(system('git rev-parse --show-toplevel'), '\n')[0]
-  return v:shell_error ? '' : root
+function! s:get_git_root(dir)
+  let dir = len(a:dir) ? a:dir : substitute(split(expand('%:p:h'), '[/\\]\.git\([/\\]\|$\)')[0], '^fugitive://', '', '')
+  let root = systemlist('git -C ' . fzf#shellescape(dir) . ' rev-parse --show-toplevel')[0]
+  return v:shell_error ? '' : (len(a:dir) ? fnamemodify(a:dir, ':p') : root)
+endfunction
+
+function! s:version_requirement(val, min)
+  for idx in range(0, len(a:min) - 1)
+    let v = get(a:val, idx, 0)
+    if     v < a:min[idx] | return 0
+    elseif v > a:min[idx] | return 1
+    endif
+  endfor
+  return 1
+endfunction
+
+function! s:git_version_requirement(...)
+  if !exists('s:git_version')
+    let s:git_version = map(split(split(system('git --version'))[2], '\.'), 'str2nr(v:val)')
+  endif
+  return s:version_requirement(s:git_version, a:000)
 endfunction
 
 function! fzf#vim#gitfiles(args, ...)
-  let root = s:get_git_root()
+  let dir = get(get(a:, 1, {}), 'dir', '')
+  let root = s:get_git_root(dir)
   if empty(root)
     return s:warn('Not in git repo')
   endif
+  let prefix = 'git -C ' . fzf#shellescape(root) . ' '
   if a:args != '?'
+    let source = prefix . 'ls-files -z ' . a:args
+    if s:git_version_requirement(2, 31)
+      let source .= ' --deduplicate'
+    endif
     return s:fzf('gfiles', {
-    \ 'source':  'git ls-files '.a:args.(s:is_win ? '' : ' | uniq'),
+    \ 'source':  source,
     \ 'dir':     root,
-    \ 'options': '-m --prompt "GitFiles> "'
+    \ 'options': '-m --read0 --prompt "GitFiles> "'
     \}, a:000)
   endif
 
   " Here be dragons!
   " We're trying to access the common sink function that fzf#wrap injects to
   " the options dictionary.
+  let bar = s:is_win ? '^|' : '|'
+  let diff_prefix = 'git -C ' . s:escape_for_bash(root) . ' '
   let preview = printf(
-    \ 'bash -c "if [[ {1} =~ M ]]; then %s; else %s {-1}; fi"',
+    \ s:bash() . ' -c "if [[ {1} =~ M ]]; then %s; else %s {-1}; fi"',
     \ executable('delta')
-      \ ? 'git diff -- {-1} | delta --width $FZF_PREVIEW_COLUMNS --file-style=omit | sed 1d'
-      \ : 'git diff --color=always -- {-1} | sed 1,4d',
-    \ s:bin.preview)
+      \ ? diff_prefix . 'diff -- {-1} ' . bar . ' delta --width $FZF_PREVIEW_COLUMNS --file-style=omit ' . bar . ' sed 1d'
+      \ : diff_prefix . 'diff --color=always -- {-1} ' . bar . ' sed 1,4d',
+    \ s:escape_for_bash(s:bin.preview))
   let wrapped = fzf#wrap({
-  \ 'source':  'git -c color.status=always status --short --untracked-files=all',
+  \ 'source':  prefix . '-c color.status=always status --short --untracked-files=all',
   \ 'dir':     root,
   \ 'options': ['--ansi', '--multi', '--nth', '2..,..', '--tiebreak=index', '--prompt', 'GitFiles?> ', '--preview', preview]
   \})
@@ -742,22 +793,22 @@ endfunction
 " ------------------------------------------------------------------
 " Ag / Rg
 " ------------------------------------------------------------------
-function! s:ag_to_qf(line, has_column)
+function! s:ag_to_qf(line)
   let parts = matchlist(a:line, '\(.\{-}\)\s*:\s*\(\d\+\)\%(\s*:\s*\(\d\+\)\)\?\%(\s*:\(.*\)\)\?')
   let dict = {'filename': &acd ? fnamemodify(parts[1], ':p') : parts[1], 'lnum': parts[2], 'text': parts[4]}
-  if a:has_column
+  if len(parts[3])
     let dict.col = parts[3]
   endif
   return dict
 endfunction
 
-function! s:ag_handler(lines, has_column)
+function! s:ag_handler(lines)
   if len(a:lines) < 2
     return
   endif
 
   let cmd = s:action_for(a:lines[0], 'e')
-  let list = map(filter(a:lines[1:], 'len(v:val)'), 's:ag_to_qf(v:val, a:has_column)')
+  let list = map(filter(a:lines[1:], 'len(v:val)'), 's:ag_to_qf(v:val)')
   if empty(list)
     return
   endif
@@ -766,17 +817,17 @@ function! s:ag_handler(lines, has_column)
   try
     call s:open(cmd, first.filename)
     execute first.lnum
-    if a:has_column
+    if has_key(first, 'col')
       call cursor(0, first.col)
     endif
-    normal! zz
+    normal! zvzz
   catch
   endtry
 
   call s:fill_quickfix(list)
 endfunction
 
-" query, [[ag options], options]
+" query, [ag options], [spec (dict)], [fullscreen (bool)]
 function! fzf#vim#ag(query, ...)
   if type(a:query) != s:TYPE.string
     return s:warn('Invalid query argument')
@@ -788,7 +839,7 @@ function! fzf#vim#ag(query, ...)
   return call('fzf#vim#ag_raw', insert(args, command, 0))
 endfunction
 
-" ag command suffix, [options]
+" ag command suffix, [spec (dict)], [fullscreen (bool)]
 function! fzf#vim#ag_raw(command_suffix, ...)
   if !executable('ag')
     return s:warn('ag is not found')
@@ -796,8 +847,9 @@ function! fzf#vim#ag_raw(command_suffix, ...)
   return call('fzf#vim#grep', extend(['ag --nogroup --column --color '.a:command_suffix, 1], a:000))
 endfunction
 
-" command (string), has_column (0/1), [options (dict)], [fullscreen (0/1)]
-function! fzf#vim#grep(grep_command, has_column, ...)
+" command (string), [spec (dict)], [fullscreen (bool)]
+function! fzf#vim#grep(grep_command, ...)
+  let args = copy(a:000)
   let words = []
   for word in split(a:grep_command)
     if word !~# '^[a-z]'
@@ -809,22 +861,57 @@ function! fzf#vim#grep(grep_command, has_column, ...)
   let name    = join(words, '-')
   let capname = join(map(words, 'toupper(v:val[0]).v:val[1:]'), '')
   let opts = {
-  \ 'column':  a:has_column,
   \ 'options': ['--ansi', '--prompt', capname.'> ',
   \             '--multi', '--bind', 'alt-a:select-all,alt-d:deselect-all',
   \             '--delimiter', ':', '--preview-window', '+{2}-/2']
   \}
+  if len(args) && type(args[0]) == s:TYPE.bool
+    call remove(args, 0)
+  endif
+
   function! opts.sink(lines)
-    return s:ag_handler(a:lines, self.column)
+    return s:ag_handler(a:lines)
   endfunction
   let opts['sink*'] = remove(opts, 'sink')
   try
     let prev_default_command = $FZF_DEFAULT_COMMAND
     let $FZF_DEFAULT_COMMAND = a:grep_command
-    return s:fzf(name, opts, a:000)
+    return s:fzf(name, opts, args)
   finally
     let $FZF_DEFAULT_COMMAND = prev_default_command
   endtry
+endfunction
+
+
+" command_prefix (string), initial_query (string), [spec (dict)], [fullscreen (bool)]
+function! fzf#vim#grep2(command_prefix, query, ...)
+  let args = copy(a:000)
+  let words = []
+  for word in split(a:command_prefix)
+    if word !~# '^[a-z]'
+      break
+    endif
+    call add(words, word)
+  endfor
+  let words = empty(words) ? ['grep'] : words
+  let name = join(words, '-')
+  let opts = {
+  \ 'source': ':',
+  \ 'options': ['--ansi', '--prompt', toupper(name).'> ', '--query', a:query,
+  \             '--disabled',
+  \             '--bind', 'start:reload:'.a:command_prefix.' '.shellescape(a:query),
+  \             '--bind', 'change:reload:'.a:command_prefix.' {q} || :',
+  \             '--multi', '--bind', 'alt-a:select-all,alt-d:deselect-all',
+  \             '--delimiter', ':', '--preview-window', '+{2}-/2']
+  \}
+  if len(args) && type(args[0]) == s:TYPE.bool
+    call remove(args, 0)
+  endif
+  function! opts.sink(lines)
+    return s:ag_handler(a:lines)
+  endfunction
+  let opts['sink*'] = remove(opts, 'sink')
+  return s:fzf(name, opts, args)
 endfunction
 
 " ------------------------------------------------------------------
@@ -867,14 +954,14 @@ function! s:btags_sink(lines)
   normal! zvzz
 endfunction
 
-" query, [[tag commands], options]
+" query, [tag commands], [spec (dict)], [fullscreen (bool)]
 function! fzf#vim#buffer_tags(query, ...)
   let args = copy(a:000)
   let escaped = fzf#shellescape(expand('%'))
   let null = s:is_win ? 'nul' : '/dev/null'
   let sort = has('unix') && !has('win32unix') && executable('sort') ? '| sort -s -k 5' : ''
   let tag_cmds = (len(args) > 1 && type(args[0]) != type({})) ? remove(args, 0) : [
-    \ printf('ctags -f - --sort=yes --excmd=number --language-force=%s %s 2> %s %s', &filetype, escaped, null, sort),
+    \ printf('ctags -f - --sort=yes --excmd=number --language-force=%s %s 2> %s %s', get({ 'cpp': 'c++' }, &filetype, &filetype), escaped, null, sort),
     \ printf('ctags -f - --sort=yes --excmd=number %s 2> %s %s', escaped, null, sort)]
   if type(tag_cmds) != type([])
     let tag_cmds = [tag_cmds]
@@ -989,7 +1076,7 @@ endfunction
 " ------------------------------------------------------------------
 " Commands
 " ------------------------------------------------------------------
-let s:nbs = nr2char(0x2007)
+let s:nbs = nr2char(0xa0)
 
 function! s:format_cmd(line)
   return substitute(a:line, '\C \([A-Z]\S*\) ',
@@ -1004,8 +1091,7 @@ function! s:command_sink(lines)
   if empty(a:lines[0])
     call feedkeys(':'.cmd.(a:lines[1][0] == '!' ? '' : ' '), 'n')
   else
-    call histadd(':', cmd)
-    execute cmd
+    call feedkeys(':'.cmd."\<cr>", 'n')
   endif
 endfunction
 
@@ -1084,6 +1170,47 @@ function! fzf#vim#marks(...)
 endfunction
 
 " ------------------------------------------------------------------
+" Jumps
+" ------------------------------------------------------------------
+function! s:jump_format(line)
+  return substitute(a:line, '[0-9]\+', '\=s:yellow(submatch(0), "Number")', '')
+endfunction
+
+function! s:jump_sink(lines)
+  if len(a:lines) < 2
+    return
+  endif
+  let cmd = s:action_for(a:lines[0])
+  if !empty(cmd)
+    execute 'silent' cmd
+  endif
+  let idx = index(s:jumplist, a:lines[1])
+  if idx == -1
+    return
+  endif
+  let current = match(s:jumplist, '\v^\s*\>')
+  let delta = idx - current
+  if delta < 0
+    execute 'normal! ' . -delta . "\<C-O>"
+  else
+    execute 'normal! ' . delta . "\<C-I>"
+  endif
+endfunction
+
+function! fzf#vim#jumps(...)
+  redir => cout
+  silent jumps
+  redir END
+  let s:jumplist = split(cout, '\n')
+  let current = -match(s:jumplist, '\v^\s*\>')
+  return s:fzf('jumps', {
+  \ 'source'  : extend(s:jumplist[0:0], map(s:jumplist[1:], 's:jump_format(v:val)')),
+  \ 'sink*'   : s:function('s:jump_sink'),
+  \ 'options' : '+m -x --ansi --tiebreak=index --cycle --scroll-off 999 --sync --bind start:pos:'.current.' --tac --header-lines 1 --tiebreak=begin --prompt "Jumps> "',
+  \ }, a:000)
+endfunction
+
+" ------------------------------------------------------------------
 " Help tags
 " ------------------------------------------------------------------
 function! s:helptag_sink(line)
@@ -1096,8 +1223,8 @@ function! s:helptag_sink(line)
 endfunction
 
 function! fzf#vim#helptags(...)
-  if !executable('grep') || !executable('perl')
-    return s:warn('Helptags command requires grep and perl')
+  if !executable('perl')
+    return s:warn('Helptags command requires perl')
   endif
   let sorted = sort(split(globpath(&runtimepath, 'doc/tags', 1), '\n'))
   let tags = exists('*uniq') ? uniq(sorted) : fzf#vim#_uniq(sorted)
@@ -1106,12 +1233,12 @@ function! fzf#vim#helptags(...)
     silent! call delete(s:helptags_script)
   endif
   let s:helptags_script = tempname()
-  call writefile(['/('.(s:is_win ? '^[A-Z]:[\/\\].*?[^:]' : '.*?').'):(.*?)\t(.*?)\t/; printf(qq('.s:green('%-40s', 'Label').'\t%s\t%s\n), $2, $3, $1)'], s:helptags_script)
+
+  call writefile(['use Fatal qw(open close); for my $filename (@ARGV) { open(my $file,q(<),$filename); while (<$file>) { /(.*?)\t(.*?)\t(.*)/; push @lines, sprintf(qq('.s:green('%-40s', 'Label').'\t%s\t%s\t%s\n), $1, $2, $filename, $3); } close($file); } print for sort @lines;'], s:helptags_script)
   return s:fzf('helptags', {
-  \ 'source':  'grep -H ".*" '.join(map(tags, 'fzf#shellescape(v:val)')).
-    \ ' | perl -n '.fzf#shellescape(s:helptags_script).' | sort',
+  \ 'source': 'perl '.fzf#shellescape(s:helptags_script).' '.join(map(tags, 'fzf#shellescape(v:val)')),
   \ 'sink':    s:function('s:helptag_sink'),
-  \ 'options': ['--ansi', '+m', '--tiebreak=begin', '--with-nth', '..-2']}, a:000)
+  \ 'options': ['--ansi', '+m', '--tiebreak=begin', '--with-nth', '..3']}, a:000)
 endfunction
 
 " ------------------------------------------------------------------
@@ -1202,29 +1329,33 @@ function! s:commits_sink(lines)
 endfunction
 
 function! s:commits(range, buffer_local, args)
-  let s:git_root = s:get_git_root()
+  let s:git_root = s:get_git_root('')
   if empty(s:git_root)
     return s:warn('Not in git repository')
   endif
 
-  let source = 'git log '.get(g:, 'fzf_commits_log_options', '--color=always '.fzf#shellescape('--format=%C(auto)%h%d %s %C(green)%cr'))
-  let current = expand('%')
+  let prefix = 'git -C ' . fzf#shellescape(s:git_root) . ' '
+  let source = prefix . 'log '.get(g:, 'fzf_commits_log_options', '--color=always '.fzf#shellescape('--format=%C(auto)%h%d %s %C(green)%cr'))
+  let current = expand('%:p')
   let managed = 0
   if !empty(current)
-    call system('git show '.fzf#shellescape(current).' 2> '.(s:is_win ? 'nul' : '/dev/null'))
+    call system(prefix . 'show '.fzf#shellescape(current).' 2> '.(s:is_win ? 'nul' : '/dev/null'))
     let managed = !v:shell_error
   endif
+
+  let args = copy(a:args)
+  let log_opts = len(args) && type(args[0]) == type('') ? remove(args, 0) : ''
 
   if len(a:range) || a:buffer_local
     if !managed
       return s:warn('The current buffer is not in the working tree')
     endif
     let source .= len(a:range)
-      \ ? printf(' -L %d,%d:%s --no-patch', a:range[0], a:range[1], fzf#shellescape(current))
-      \ : (' --follow '.fzf#shellescape(current))
+      \ ? join([printf(' -L %d,%d:%s --no-patch', a:range[0], a:range[1], fzf#shellescape(current)), log_opts])
+      \ : join([' --follow', log_opts, fzf#shellescape(current)])
     let command = 'BCommits'
   else
-    let source .= ' --graph'
+    let source .= join([' --graph', log_opts])
     let command = 'Commits'
   endif
 
@@ -1244,12 +1375,14 @@ function! s:commits(range, buffer_local, args)
   endif
 
   if !s:is_win && &columns > s:wide
-    let suffix = executable('delta') ? '| delta --width $FZF_PREVIEW_COLUMNS' : '--color=always'
+    let suffix = executable('delta') ? '| delta --width $FZF_PREVIEW_COLUMNS' : ''
+    let orderfile = tempname()
+    call writefile([current[len(s:git_root)+1:]], orderfile)
     call extend(options.options,
-    \ ['--preview', 'echo {} | grep -o "[a-f0-9]\{7,\}" | head -1 | xargs git show --format=format: ' . suffix])
+    \ ['--preview', 'echo {} | grep -o "[a-f0-9]\{7,\}" | head -1 | xargs ' . prefix . 'show -O'.fzf#shellescape(orderfile).' --format=format: --color=always ' . suffix])
   endif
 
-  return s:fzf(a:buffer_local ? 'bcommits' : 'commits', options, a:args)
+  return s:fzf(a:buffer_local ? 'bcommits' : 'commits', options, args)
 endfunction
 
 " Heuristically determine if the user specified a range
@@ -1266,6 +1399,7 @@ function! s:given_range(line1, line2)
   return []
 endfunction
 
+" [git-log-args], [spec (dict)], [fullscreen (bool)]
 function! fzf#vim#commits(...) range
   if exists('b:fzf_winview')
     call winrestview(b:fzf_winview)
@@ -1274,6 +1408,7 @@ function! fzf#vim#commits(...) range
   return s:commits(s:given_range(a:firstline, a:lastline), 0, a:000)
 endfunction
 
+" [git-log-args], [spec (dict)], [fullscreen (bool)]
 function! fzf#vim#buffer_commits(...) range
   if exists('b:fzf_winview')
     call winrestview(b:fzf_winview)
